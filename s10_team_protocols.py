@@ -181,6 +181,7 @@ class TeammateManager:
                     tools=tools, max_tokens=8000,
                 )
             except Exception:
+                print(f"[{name}] API error: {e}")
                 break
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
@@ -222,10 +223,10 @@ class TeammateManager:
                     "content": str(output)
                 })
                 if tool_call.function.name == "shutdown_response" and args.get("approve", False):
-                    should_exit = True            
-        member = self._find_member(name)
-        if member:
-            with self._lock:
+                    should_exit = True
+        with self._lock:          
+            member = self._find_member(name)
+            if member:
                 member["status"] = "shutdown" if should_exit else "idle"
                 self._save_config()
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:

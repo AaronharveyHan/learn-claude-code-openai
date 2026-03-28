@@ -271,32 +271,39 @@ def agent_loop(messages: list):
         # If the model didn't call a tool, we're done
         if not tool_calls:
             return message.content
-        manual_compact = False
         # Execute each tool call, collect results
         focus = None
-        for tool_call in tool_calls:
+        non_compact_calls = [tc for tc in tool_calls if tc.function.name != "compact"]
+        compact_calls     = [tc for tc in tool_calls if tc.function.name == "compact"]
+        for tool_call in non_compact_calls:
             args = json.loads(tool_call.function.arguments or "{}" )
-            if tool_call.function.name == "compact":
-                manual_compact = True
-                focus = args.get("focus")
-                output = "Compressing..."
-            else:
-                handler = TOOL_HANDLERS.get(tool_call.function.name)
-                try:
-                    output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
+            handler = TOOL_HANDLERS.get(tool_call.function.name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+            except Exception as e:
+                output = f"Error: {e}"
             print(f"> {tool_call.function.name}: {output[:200]}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "name": tool_call.function.name,
                 "content": str(output)
-            })    
-        # Layer 3: manual compact triggered by the compact tool
-        if manual_compact:
+            })  
+        for tool_call in compact_calls:
+            # 最后处理 compact
+            focus = json.loads(tool_call.function.arguments or "{}").get("focus")
+            messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                            "name": "compact", "content": "OK"})  
+        # Layer 3: compact always runs last, after all other tools
+        if compact_calls:
+            focus_parts = [
+                json.loads(tc.function.arguments or "{}").get("focus", "")
+                for tc in compact_calls
+            ]
+            focus = "; ".join(f for f in focus_parts if f) or None
             print("[manual compact]")
-            messages[:] = auto_compact(messages, focus)        
+            messages[:] = auto_compact(messages, focus)
+            # auto_compact 替换了整个 messages，直接进入下一轮循环       
         
 if __name__ == "__main__":
     history = [{"role": "system", "content": SYSTEM}]

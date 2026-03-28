@@ -87,6 +87,9 @@ class TaskManager:
     def _clear_dependency(self, completed_id: int):
         """Remove completed_id from all other tasks' blockedBy lists."""
         for f in self.dir.glob("task_*.json"):
+            fid = int(f.stem.split("_")[1])
+            if fid == completed_id:   # 跳过自身
+                continue
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
                 task["blockedBy"].remove(completed_id)

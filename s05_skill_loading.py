@@ -110,11 +110,18 @@ def run_bash(command: str) -> str:
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-def run_read(path: str, limit: int = None) -> str:
+def run_read(path: str, limit_lines: int = None) -> str:
+    """
+    Args:
+        limit_lines: 最多读取的行数，None 表示读全部，0 表示不读内容
+    """
     try:
         lines = safe_path(path).read_text().splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
+        if limit_lines is not None:          # 明确区分 0 和 None
+            if limit_lines == 0:
+                return f"(file has {len(lines)} lines, no content read)"
+            if limit_lines < len(lines):
+                lines = lines[:limit_lines] + [f"... ({len(lines) - limit_lines} more)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
@@ -138,7 +145,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit_lines")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
@@ -167,7 +174,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "limit": {"type": "integer"}
+                    "limit_lines": {"type": "integer"}
                 },
                 "required": ["path"]
             }
