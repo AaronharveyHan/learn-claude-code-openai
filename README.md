@@ -1,5 +1,7 @@
 # Learn Claude Code OpenAI
 
+这是基于https://learn.shareai.run/zh/ 项目的辅助开发,用于在中国大陆基于阿里百炼的千问模型API调用,来实现该项目的学习
+改写了模型调用,模型返回内容的引用方法,适配penai规约
 用独立可运行的 Python 脚本，从「最小 Agent 循环」一路演示到「任务、团队、自治与工作树隔离」——相当于把 **Claude Code / 类 Cursor 编码智能体** 的核心模式拆开、逐层叠加，便于阅读与实验。
 
 ## 适用场景
