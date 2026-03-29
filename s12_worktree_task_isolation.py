@@ -25,6 +25,7 @@ Tasks are the control plane and worktrees are the execution plane.
 Key insight: "Isolate by directory, coordinate by task ID."
 """
 import json
+import logging
 import os
 import re
 import subprocess
@@ -34,6 +35,45 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+# ── Logger setup ──────────────────────────────────────────────────────────────
+LOG_FILE = "agent_debug.log"
+
+class ColorFormatter(logging.Formatter):
+    """终端彩色输出，文件输出保持纯文本。"""
+    COLORS = {
+        logging.DEBUG:    "\033[90m",   # 灰
+        logging.INFO:     "\033[36m",   # 青
+        logging.WARNING:  "\033[33m",   # 黄
+        logging.ERROR:    "\033[31m",   # 红
+        logging.CRITICAL: "\033[35m",   # 紫
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, "")
+        record.msg = f"{color}{record.msg}{self.RESET}"
+        return super().format(record)
+
+def setup_logger(name: str = "agent") -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%H:%M:%S"
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(ColorFormatter(fmt, datefmt))
+
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(fmt, datefmt))
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+log = setup_logger()
 WORKDIR = Path.cwd()
 client = OpenAI(
                 api_key=os.getenv("llm_api_key"),          # None 时自动读 OPENAI_API_KEY 或 DASHSCOPE_API_KEY
@@ -135,6 +175,7 @@ class TaskManager:
             "updated_at": time.time(),
         }
         self._save(task)
+        log.info("TASK create id=%d subject=%r", task["id"], subject[:60])
         self._next_id += 1
         return json.dumps(task, indent=2)
     def get(self, task_id: int) -> str:
@@ -143,6 +184,7 @@ class TaskManager:
         return self._path(task_id).exists()
     def update(self, task_id: int, status: str = None, owner: str = None) -> str:
         task = self._load(task_id)
+        old_status = task["status"]
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
@@ -151,9 +193,12 @@ class TaskManager:
             task["owner"] = owner
         task["updated_at"] = time.time()
         self._save(task)
+        log.info("TASK update id=%d status=%s->%s owner=%s",
+                 task_id, old_status, task["status"], task.get("owner",""))
         return json.dumps(task, indent=2)
     def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
         task = self._load(task_id)
+        old_status = task["status"]
         task["worktree"] = worktree
         if owner:
             task["owner"] = owner
@@ -161,17 +206,22 @@ class TaskManager:
             task["status"] = "in_progress"
         task["updated_at"] = time.time()
         self._save(task)
+        log.info("TASK bind_worktree id=%d wt=%s status=%s->%s",
+                 task_id, worktree, old_status, task["status"])
         return json.dumps(task, indent=2)
     def unbind_worktree(self, task_id: int) -> str:
         task = self._load(task_id)
+        old_wt = task.get("worktree", "")
         task["worktree"] = ""
         task["updated_at"] = time.time()
         self._save(task)
+        log.info("TASK unbind_worktree id=%d old_wt=%s", task_id, old_wt)
         return json.dumps(task, indent=2)
     def list_all(self) -> str:
         tasks = []
         for f in sorted(self.dir.glob("task_*.json")):
             tasks.append(json.loads(f.read_text()))
+        log.debug("TASK list_all total=%d", len(tasks))
         if not tasks:
             return "No tasks."
         lines = []
@@ -248,11 +298,13 @@ class WorktreeManager:
             raise ValueError(f"Task {task_id} not found")
         path = self.dir / name
         branch = f"wt/{name}"
+        log.info("WT   create >>> name=%s task_id=%s base_ref=%s", name, task_id, base_ref)
         self.events.emit(
             "worktree.create.before",
             task={"id": task_id} if task_id is not None else {},
             worktree={"name": name, "base_ref": base_ref},
         )
+        t0 = time.perf_counter()
         try:
             self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
             entry = {
@@ -278,8 +330,10 @@ class WorktreeManager:
                     "status": "active",
                 },
             )
+            log.info("WT   create <<< name=%s branch=%s elapsed=%.2fs", name, branch, time.perf_counter() - t0)
             return json.dumps(entry, indent=2)
         except Exception as e:
+            log.error("WT   create FAILED name=%s: %s", name, e)
             self.events.emit(
                 "worktree.create.failed",
                 task={"id": task_id} if task_id is not None else {},
@@ -301,11 +355,14 @@ class WorktreeManager:
             )
         return "\n".join(lines)
     def status(self, name: str) -> str:
+        log.debug("WT   status name=%s", name)
         wt = self._find(name)
         if not wt:
+            log.warning("WT   status unknown name=%s", name)
             return f"Error: Unknown worktree '{name}'"
         path = Path(wt["path"])
         if not path.exists():
+            log.warning("WT   status path missing name=%s path=%s", name, path)
             return f"Error: Worktree path missing: {path}"
         r = subprocess.run(
             ["git", "status", "--short", "--branch"],
@@ -319,13 +376,18 @@ class WorktreeManager:
     def run(self, name: str, command: str) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
+            log.warning("WT   run blocked dangerous command name=%s cmd=%r", name, command[:80])
             return "Error: Dangerous command blocked"
         wt = self._find(name)
         if not wt:
+            log.warning("WT   run unknown worktree name=%s", name)
             return f"Error: Unknown worktree '{name}'"
         path = Path(wt["path"])
         if not path.exists():
+            log.warning("WT   run path missing name=%s path=%s", name, path)
             return f"Error: Worktree path missing: {path}"
+        log.debug("WT   run >>> name=%s cmd=%r", name, command[:120])
+        t0 = time.perf_counter()
         try:
             r = subprocess.run(
                 command,
@@ -336,18 +398,26 @@ class WorktreeManager:
                 timeout=300,
             )
             out = (r.stdout + r.stderr).strip()
-            return out[:50000] if out else "(no output)"
+            result = out[:50000] if out else "(no output)"
         except subprocess.TimeoutExpired:
+            log.error("WT   run TIMEOUT (300s) name=%s cmd=%r", name, command[:80])
             return "Error: Timeout (300s)"
+        log.debug("WT   run <<< name=%s elapsed=%.2fs rc=%d out_len=%d",
+                  name, time.perf_counter() - t0, r.returncode, len(result))
+        return result
     def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
         wt = self._find(name)
         if not wt:
+            log.warning("WT   remove unknown name=%s", name)
             return f"Error: Unknown worktree '{name}'"
+        log.info("WT   remove >>> name=%s force=%s complete_task=%s task_id=%s",
+                 name, force, complete_task, wt.get("task_id"))
         self.events.emit(
             "worktree.remove.before",
             task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
             worktree={"name": name, "path": wt.get("path")},
         )
+        t0 = time.perf_counter()
         try:
             args = ["worktree", "remove"]
             if force:
@@ -359,6 +429,8 @@ class WorktreeManager:
                 before = json.loads(self.tasks.get(task_id))
                 self.tasks.update(task_id, status="completed")
                 self.tasks.unbind_worktree(task_id)
+                log.info("WT   remove task.completed task_id=%d subject=%r",
+                         task_id, before.get("subject","")[:60])
                 self.events.emit(
                     "task.completed",
                     task={
@@ -379,8 +451,10 @@ class WorktreeManager:
                 task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
                 worktree={"name": name, "path": wt.get("path"), "status": "removed"},
             )
+            log.info("WT   remove <<< name=%s elapsed=%.2fs", name, time.perf_counter() - t0)
             return f"Removed worktree '{name}'"
         except Exception as e:
+            log.error("WT   remove FAILED name=%s: %s", name, e)
             self.events.emit(
                 "worktree.remove.failed",
                 task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
@@ -391,6 +465,7 @@ class WorktreeManager:
     def keep(self, name: str) -> str:
         wt = self._find(name)
         if not wt:
+            log.warning("WT   keep unknown name=%s", name)
             return f"Error: Unknown worktree '{name}'"
         idx = self._load_index()
         kept = None
@@ -400,6 +475,7 @@ class WorktreeManager:
                 item["kept_at"] = time.time()
                 kept = item
         self._save_index(idx)
+        log.info("WT   keep name=%s task_id=%s", name, wt.get("task_id"))
         self.events.emit(
             "worktree.keep",
             task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
@@ -411,6 +487,24 @@ class WorktreeManager:
         )
         return json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
+# ── Message logging helpers ────────────────────────────────────────────────────
+def _msg_summary(msg: dict) -> str:
+    role = msg.get("role", "?")
+    if role == "system":
+        return f"system: {msg.get('content','')[:60]!r}"
+    if role == "tool":
+        return f"tool[{msg.get('name','?')}]: {str(msg.get('content',''))[:60]!r}"
+    if role == "assistant":
+        tcs = msg.get("tool_calls", [])
+        if tcs:
+            names = [tc["function"]["name"] for tc in tcs]
+            return f"assistant: tool_calls={names}"
+        return f"assistant: {str(msg.get('content',''))[:60]!r}"
+    return f"{role}: {str(msg.get('content',''))[:60]!r}"
+
+def _log_msg_append(messages: list):
+    log.debug("MSG  +[%d] %s", len(messages), _msg_summary(messages[-1]))
+
 # -- Base tools (kept minimal, same style as previous sessions) --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -420,7 +514,10 @@ def safe_path(p: str) -> Path:
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
+        log.warning("BASH blocked dangerous command: %r", command[:80])
         return "Error: Dangerous command blocked"
+    log.debug("BASH  >>> %r", command[:120])
+    t0 = time.perf_counter()
     try:
         r = subprocess.run(
             command,
@@ -431,35 +528,54 @@ def run_bash(command: str) -> str:
             timeout=120,
         )
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        result = out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
+        log.error("BASH  <<< TIMEOUT (120s) cmd=%r", command[:80])
         return "Error: Timeout (120s)"
+    log.debug("BASH  <<< elapsed=%.2fs rc=%d out_len=%d", time.perf_counter() - t0, r.returncode, len(result))
+    return result
 def run_read(path: str, limit: int = None) -> str:
+    log.debug("READ  >>> path=%s limit=%s", path, limit)
+    t0 = time.perf_counter()
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        result = "\n".join(lines)[:50000]
     except Exception as e:
+        log.error("READ  <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("READ  <<< elapsed=%.2fs lines=%d", time.perf_counter() - t0, len(lines))
+    return result
 def run_write(path: str, content: str) -> str:
+    log.debug("WRITE >>> path=%s bytes=%d", path, len(content))
+    t0 = time.perf_counter()
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes"
+        result = f"Wrote {len(content)} bytes"
     except Exception as e:
+        log.error("WRITE <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("WRITE <<< elapsed=%.2fs path=%s", time.perf_counter() - t0, path)
+    return result
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    log.debug("EDIT  >>> path=%s old=%r new=%r", path, old_text[:40], new_text[:40])
+    t0 = time.perf_counter()
     try:
         fp = safe_path(path)
         c = fp.read_text()
         if old_text not in c:
+            log.warning("EDIT  <<< text not found path=%s old=%r", path, old_text[:40])
             return f"Error: Text not found in {path}"
         fp.write_text(c.replace(old_text, new_text, 1))
-        return f"Edited {path}"
+        result = f"Edited {path}"
     except Exception as e:
+        log.error("EDIT  <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("EDIT  <<< elapsed=%.2fs path=%s", time.perf_counter() - t0, path)
+    return result
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -698,14 +814,23 @@ TOOLS = [
         },
     },
 ]
+_agent_round = 0
+
 def agent_loop(messages: list):
+    global _agent_round
     while True:
+        _agent_round += 1
+        log.debug("AGENT Round %d msgs=%d", _agent_round, len(messages))
+        t0 = time.perf_counter()
         response = client.chat.completions.create(
             model=MODEL, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        elapsed = time.perf_counter() - t0
         message = response.choices[0].message
         tool_calls = message.tool_calls or []
+        log.debug("AGENT LLM <<< elapsed=%.2fs stop=%s tool_calls=%d",
+                  elapsed, response.choices[0].finish_reason, len(tool_calls))
         assistant_msg = {
             "role": "assistant",
             "content": message.content or ""  # 或者条件过滤掉 content 键
@@ -723,17 +848,24 @@ def agent_loop(messages: list):
                 for tc in tool_calls
             ]
         messages.append(assistant_msg)
+        _log_msg_append(messages)
         if not tool_calls:
+            log.info("AGENT done (no tool_calls) round=%d", _agent_round)
             return message.content
-        
+
         for tool_call in tool_calls:
             assert tool_call.id is not None
             args = json.loads(tool_call.function.arguments)
             handler = TOOL_HANDLERS.get(tool_call.function.name)
+            log.debug("AGENT TOOL >>> %s args=%s", tool_call.function.name, str(args)[:120])
+            t1 = time.perf_counter()
             try:
                 output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
             except Exception as e:
-                output = f"Error: {e}" 
+                log.error("AGENT TOOL <<< %s EXCEPTION: %s", tool_call.function.name, e)
+                output = f"Error: {e}"
+            log.debug("AGENT TOOL <<< %s elapsed=%.2fs out=%r",
+                      tool_call.function.name, time.perf_counter() - t1, str(output)[:80])
             print(f"> {tool_call.function.name}: {output[:200]}")
             messages.append({
                 "role": "tool",
@@ -741,11 +873,15 @@ def agent_loop(messages: list):
                 "name": tool_call.function.name,
                 "content": str(output)
             })
+            _log_msg_append(messages)
 if __name__ == "__main__":
+    log.info("Agent started model=%s workdir=%s repo_root=%s git=%s",
+             MODEL, WORKDIR, REPO_ROOT, WORKTREES.git_available)
     print(f"Repo root for s12: {REPO_ROOT}")
     if not WORKTREES.git_available:
         print("Note: Not in a git repo. worktree_* tools will return errors.")
     history = [{"role": "system", "content": SYSTEM}]
+    _log_msg_append(history)
     while True:
         try:
             query = input("\033[36ms12 >> \033[0m")
@@ -753,6 +889,10 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        log.info("USER >>> %r", query[:120])
         history.append({"role": "user", "content": query})
+        _log_msg_append(history)
         response_content = agent_loop(history)
+        log.info("AGENT <<< %r", str(response_content)[:120])
         print(response_content)
+    log.info("Agent exited")

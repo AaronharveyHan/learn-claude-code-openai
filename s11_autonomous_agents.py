@@ -30,6 +30,7 @@ identity re-injection after context compression. Builds on s10's protocols.
 Key insight: "The agent finds work itself."
 """
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -39,6 +40,45 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv(override=True)
+# ── Logger setup ──────────────────────────────────────────────────────────────
+LOG_FILE = "agent_debug.log"
+
+class ColorFormatter(logging.Formatter):
+    """终端彩色输出，文件输出保持纯文本。"""
+    COLORS = {
+        logging.DEBUG:    "\033[90m",   # 灰
+        logging.INFO:     "\033[36m",   # 青
+        logging.WARNING:  "\033[33m",   # 黄
+        logging.ERROR:    "\033[31m",   # 红
+        logging.CRITICAL: "\033[35m",   # 紫
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, "")
+        record.msg = f"{color}{record.msg}{self.RESET}"
+        return super().format(record)
+
+def setup_logger(name: str = "agent") -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%H:%M:%S"
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(ColorFormatter(fmt, datefmt))
+
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(fmt, datefmt))
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+log = setup_logger()
 
 WORKDIR = Path.cwd()
 client = OpenAI(
@@ -80,6 +120,7 @@ class MessageBus:
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
         if msg_type not in VALID_MSG_TYPES:
+            log.warning("BUS  send invalid type=%r from=%s to=%s", msg_type, sender, to)
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
             "type": msg_type,
@@ -94,6 +135,7 @@ class MessageBus:
         with self._get_lock(to):
             with open(inbox_path, "a") as f:
                 f.write(json.dumps(msg) + "\n")
+        log.info("BUS  send type=%s from=%s to=%s content=%r", msg_type, sender, to, content[:80])
         return f"Sent {msg_type} to {to}"
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
@@ -110,6 +152,8 @@ class MessageBus:
                     messages.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass                       # 顺手处理损坏行，不让解析异常丢掉整批消息
+        if messages:
+            log.debug("BUS  read_inbox name=%s count=%d", name, len(messages))
         return messages
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
         count = 0
@@ -117,8 +161,29 @@ class MessageBus:
             if name != sender:
                 self.send(sender, name, content, "broadcast")
                 count += 1
+        log.info("BUS  broadcast from=%s count=%d content=%r", sender, count, content[:80])
         return f"Broadcast to {count} teammates"
 BUS = MessageBus(INBOX_DIR)
+# ── Message logging helpers ────────────────────────────────────────────────────
+def _msg_summary(msg: dict) -> str:
+    role = msg.get("role", "?")
+    if role == "system":
+        content = msg.get("content", "")
+        return f"system: {content[:60]!r}"
+    if role == "tool":
+        return f"tool[{msg.get('name','?')}]: {str(msg.get('content',''))[:60]!r}"
+    if role == "assistant":
+        tcs = msg.get("tool_calls", [])
+        if tcs:
+            names = [tc["function"]["name"] for tc in tcs]
+            return f"assistant: tool_calls={names}"
+        return f"assistant: {str(msg.get('content',''))[:60]!r}"
+    return f"{role}: {str(msg.get('content',''))[:60]!r}"
+
+def _log_msg_append(messages: list, prefix: str = ""):
+    tag = f"[{prefix}] " if prefix else ""
+    log.debug("%sMSG  +[%d] %s", tag, len(messages), _msg_summary(messages[-1]))
+
 # -- Task board scanning --
 def scan_unclaimed_tasks() -> list:
     TASKS_DIR.mkdir(exist_ok=True)
@@ -129,27 +194,33 @@ def scan_unclaimed_tasks() -> list:
                 and not task.get("owner")
                 and not task.get("blockedBy")):
             unclaimed.append(task)
+    log.debug("TASK scan_unclaimed count=%d", len(unclaimed))
     return unclaimed
 def claim_task(task_id: int | str, owner: str) -> str:
     # 统一转为 int，兼容 JSON 字符串 id（如 "3"）和整数 id（如 3）
     try:
         task_id = int(task_id)
     except (TypeError, ValueError):
+        log.warning("TASK claim invalid task_id=%r owner=%s", task_id, owner)
         return f"Error: Invalid task_id '{task_id}', must be an integer"
 
     with _claim_lock:
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
+            log.warning("TASK claim task_id=%d not found owner=%s", task_id, owner)
             return f"Error: Task {task_id} not found"
         task = json.loads(path.read_text())
         # 双重校验：文件名和 JSON 内 id 要一致
         if int(task.get("id", -1)) != task_id:
+            log.warning("TASK claim id mismatch task_%d.json", task_id)
             return f"Error: Task file id mismatch for task_{task_id}.json"
         if task.get("status") != "pending" or task.get("owner"):
+            log.warning("TASK claim already claimed task_id=%d by=%s", task_id, task.get("owner"))
             return f"Error: Task {task_id} already claimed by {task.get('owner')}"
         task["owner"] = owner
         task["status"] = "in_progress"
         path.write_text(json.dumps(task, indent=2))
+    log.info("TASK claim task_id=%d owner=%s subject=%r", task_id, owner, task.get("subject","")[:60])
     return f"Claimed task #{task_id} for {owner}"
 # -- Identity re-injection after compression --
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
@@ -188,10 +259,13 @@ class TeammateManager:
             member = self._find_member(name)
             if member:
                 if member["status"] not in ("idle", "shutdown"):
+                    log.warning("TEAM spawn '%s' already %s", name, member["status"])
                     return f"Error: '{name}' is currently {member['status']}"
+                log.info("TEAM spawn reuse name=%s role=%s status=%s->working", name, role, member["status"])
                 member["status"] = "working"
                 member["role"] = role
             else:
+                log.info("TEAM spawn new name=%s role=%s", name, role)
                 member = {"name": name, "role": role, "status": "working"}
                 self.config["members"].append(member)
             self._save_config()
@@ -210,26 +284,40 @@ class TeammateManager:
             f"Use idle tool when you have no more work. You will auto-claim new tasks."
         )
         messages = [{"role": "system", "content": sys_prompt},{"role": "user", "content": prompt}]
+        _log_msg_append(messages, name)
+        _log_msg_append(messages[1:], name)
         tools = self._teammate_tools()
+        log.info("[%s] loop started role=%s team=%s", name, role, team_name)
+        work_cycle = 0
         while True:
+            work_cycle += 1
+            log.debug("[%s] WORK cycle=%d msgs=%d", name, work_cycle, len(messages))
             # -- WORK PHASE: standard agent loop --
-            for _ in range(50):
+            for round_num in range(50):
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
                     if msg.get("type") == "shutdown_request":
+                        log.info("[%s] shutdown_request received, exiting", name)
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
+                    _log_msg_append(messages, name)
+                log.debug("[%s] Round %d msgs=%d", name, round_num + 1, len(messages))
+                t0 = time.perf_counter()
                 try:
                     response = client.chat.completions.create(
                         model=MODEL, messages=messages,
                         tools=tools, max_tokens=8000,
                     )
-                except Exception:
+                except Exception as e:
+                    log.error("[%s] LLM exception: %s", name, e)
                     self._set_status(name, "idle")
                     return
+                elapsed = time.perf_counter() - t0
                 message = response.choices[0].message
                 tool_calls = message.tool_calls or []
+                log.debug("[%s] LLM <<< elapsed=%.2fs stop=%s tool_calls=%d",
+                          name, elapsed, response.choices[0].finish_reason, len(tool_calls))
                 assistant_msg = {
                     "role": "assistant",
                     "content": message.content or ""  # 或者条件过滤掉 content 键
@@ -247,7 +335,9 @@ class TeammateManager:
                         for tc in tool_calls
                     ]
                 messages.append(assistant_msg)
+                _log_msg_append(messages, name)
                 if not tool_calls:
+                    log.info("[%s] WORK done (no tool_calls) round=%d", name, round_num + 1)
                     return message.content
                 idle_requested = False
                 for tool_call in tool_calls:
@@ -256,6 +346,8 @@ class TeammateManager:
                         args = json.loads(tool_call.function.arguments or "{}")
                     except Exception:
                         args = {}
+                    log.debug("[%s] TOOL >>> %s args=%s", name, tool_call.function.name, str(args)[:120])
+                    t1 = time.perf_counter()
                     if tool_call.function.name == "idle":
                             idle_requested = True
                             output = "Entering idle phase. Will poll for new tasks."
@@ -263,7 +355,10 @@ class TeammateManager:
                         try:
                             output = self._exec(name, tool_call.function.name, args)
                         except Exception as e:
+                            log.error("[%s] TOOL <<< %s EXCEPTION: %s", name, tool_call.function.name, e)
                             output = f"Error: {e}"
+                    log.debug("[%s] TOOL <<< %s elapsed=%.2fs out=%r",
+                              name, tool_call.function.name, time.perf_counter() - t1, str(output)[:80])
                     print(f"> {tool_call.function.name}: {output[:200]}")
                     messages.append({
                         "role": "tool",
@@ -271,22 +366,29 @@ class TeammateManager:
                         "name": tool_call.function.name,
                         "content": str(output)
                     })
+                    _log_msg_append(messages, name)
                 if idle_requested:
+                    log.info("[%s] idle requested, entering IDLE phase", name)
                     break
 
             # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
             self._set_status(name, "idle")
+            log.info("[%s] IDLE phase started polls=%d interval=%ds",
+                     name, IDLE_TIMEOUT // max(POLL_INTERVAL, 1), POLL_INTERVAL)
             resume = False
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
-            for _ in range(polls):
+            for poll_i in range(polls):
                 time.sleep(POLL_INTERVAL)
                 inbox = BUS.read_inbox(name)
                 if inbox:
+                    log.info("[%s] IDLE inbox msg count=%d at poll=%d", name, len(inbox), poll_i + 1)
                     for msg in inbox:
                         if msg.get("type") == "shutdown_request":
+                            log.info("[%s] shutdown_request in IDLE, exiting", name)
                             self._set_status(name, "shutdown")
                             return
                         messages.append({"role": "user", "content": json.dumps(msg)})
+                        _log_msg_append(messages, name)
                     resume = True
                     break
                 unclaimed = scan_unclaimed_tasks()
@@ -295,9 +397,12 @@ class TeammateManager:
                     task_id = task.get("id")
                     if task_id is None:
                         # task 文件没有 id 字段，跳过这个损坏的任务
+                        log.warning("[%s] IDLE unclaimed task missing id field, skipping", name)
                         pass
                     else:
                         _ = claim_task(task["id"], name)
+                        log.info("[%s] IDLE auto-claimed task_id=%s subject=%r at poll=%d",
+                                 name, task["id"], task.get("subject","")[:60], poll_i + 1)
                         task_prompt = (
                             f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
                             f"{task.get('description', '')}</auto-claimed>"
@@ -305,14 +410,21 @@ class TeammateManager:
                         if len(messages) <= 3:
                             messages.insert(1, make_identity_block(name, role, team_name))
                             messages.insert(2, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                            log.debug("[%s] IDLE identity re-injected (short context)", name)
                         messages.append({"role": "user", "content": task_prompt})
+                        _log_msg_append(messages, name)
                         messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                        _log_msg_append(messages, name)
                         resume = True
                         break
+                else:
+                    log.debug("[%s] IDLE poll=%d no inbox no unclaimed tasks", name, poll_i + 1)
             if not resume:
+                log.info("[%s] IDLE timeout after %ds, shutting down", name, IDLE_TIMEOUT)
                 self._set_status(name, "shutdown")
                 return
             self._set_status(name, "working")
+            log.info("[%s] IDLE resume -> WORK", name)
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
         if tool_name == "bash":
@@ -329,19 +441,23 @@ class TeammateManager:
             return json.dumps(BUS.read_inbox(sender), indent=2)
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
+            approve = args.get("approve", False)
+            new_status = "approved" if approve else "rejected"
             with _tracker_lock:
                 if req_id in shutdown_requests:
-                    shutdown_requests[req_id]["status"] = "approved" if args.get("approve", False) else "rejected"
+                    shutdown_requests[req_id]["status"] = new_status
+            log.info("PROTO shutdown_response sender=%s req_id=%s status=%s", sender, req_id, new_status)
             BUS.send(
                 sender, "lead", args.get("reason", ""),
-                "shutdown_response", {"request_id": req_id, "approve": args.get("approve", False)},
+                "shutdown_response", {"request_id": req_id, "approve": approve},
             )
-            return f"Shutdown {'approved' if args['approve'] else 'rejected'}"
+            return f"Shutdown {'approved' if approve else 'rejected'}"
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
             with _tracker_lock:
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            log.info("PROTO plan_approval sender=%s req_id=%s plan=%r", sender, req_id, plan_text[:80])
             BUS.send(
                 sender, "lead", plan_text, "plan_approval_response",
                 {"request_id": req_id, "plan": plan_text},
@@ -349,6 +465,7 @@ class TeammateManager:
             return f"Plan submitted (request_id={req_id}). Waiting for approval."
         if tool_name == "claim_task":
             return claim_task(args["task_id"], sender)
+        log.warning("EXEC unknown tool=%s sender=%s", tool_name, sender)
         return f"Unknown tool: {tool_name}"
     def _teammate_tools(self) -> list:
         # these base tools are unchanged from s02
@@ -517,47 +634,70 @@ def _safe_path(p: str) -> Path:
 def _run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
     if any(d in command for d in dangerous):
+        log.warning("BASH blocked dangerous command: %r", command[:80])
         return "Error: Dangerous command blocked"
+    log.debug("BASH  >>> %r", command[:120])
+    t0 = time.perf_counter()
     try:
         r = subprocess.run(
             command, shell=True, cwd=WORKDIR,
             capture_output=True, text=True, timeout=120,
         )
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        result = out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
+        log.error("BASH  <<< TIMEOUT (120s) cmd=%r", command[:80])
         return "Error: Timeout (120s)"
+    log.debug("BASH  <<< elapsed=%.2fs rc=%d out_len=%d", time.perf_counter() - t0, r.returncode, len(result))
+    return result
 def _run_read(path: str, limit: int = None) -> str:
+    log.debug("READ  >>> path=%s limit=%s", path, limit)
+    t0 = time.perf_counter()
     try:
         lines = _safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        result = "\n".join(lines)[:50000]
     except Exception as e:
+        log.error("READ  <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("READ  <<< elapsed=%.2fs lines=%d", time.perf_counter() - t0, len(lines))
+    return result
 def _run_write(path: str, content: str) -> str:
+    log.debug("WRITE >>> path=%s bytes=%d", path, len(content))
+    t0 = time.perf_counter()
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes"
+        result = f"Wrote {len(content)} bytes"
     except Exception as e:
+        log.error("WRITE <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("WRITE <<< elapsed=%.2fs path=%s", time.perf_counter() - t0, path)
+    return result
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
+    log.debug("EDIT  >>> path=%s old=%r new=%r", path, old_text[:40], new_text[:40])
+    t0 = time.perf_counter()
     try:
         fp = _safe_path(path)
         c = fp.read_text()
         if old_text not in c:
+            log.warning("EDIT  <<< text not found path=%s old=%r", path, old_text[:40])
             return f"Error: Text not found in {path}"
         fp.write_text(c.replace(old_text, new_text, 1))
-        return f"Edited {path}"
+        result = f"Edited {path}"
     except Exception as e:
+        log.error("EDIT  <<< ERROR path=%s: %s", path, e)
         return f"Error: {e}"
+    log.debug("EDIT  <<< elapsed=%.2fs path=%s", time.perf_counter() - t0, path)
+    return result
 # -- Lead-specific protocol handlers --
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    log.info("PROTO shutdown_request req_id=%s target=%s", req_id, teammate)
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
@@ -567,14 +707,17 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
     with _tracker_lock:
         req = plan_requests.get(request_id)
         if not req:
+            log.warning("PROTO plan_review unknown request_id=%s", request_id)
             return f"Error: Unknown plan request_id '{request_id}'"
         req["status"] = "approved" if approve else "rejected"
+    log.info("PROTO plan_review req_id=%s approve=%s from=%s", request_id, approve, req["from"])
     BUS.send(
         "lead", req["from"], feedback, "plan_approval_response",
         {"request_id": request_id, "approve": approve, "feedback": feedback},
     )
     return f"Plan {req['status']} for '{req['from']}'"
 def _check_shutdown_status(request_id: str) -> str:
+    log.debug("PROTO check_shutdown_status req_id=%s", request_id)
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 # -- Lead tool dispatch (14 tools) --
@@ -794,25 +937,39 @@ TOOLS = [
         }
     }
 ]
+_agent_round = 0
+
 def agent_loop(messages: list):
+    global _agent_round
     while True:
+        _agent_round += 1
         inbox = BUS.read_inbox("lead")
         if inbox:
-            messages.append({
+            log.info("LEAD inbox injected count=%d at round=%d", len(inbox), _agent_round)
+            msg_in = {
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
-            })
-            messages.append({
+            }
+            messages.append(msg_in)
+            _log_msg_append(messages)
+            msg_ack = {
                 "role": "assistant",
                 "content": "Noted inbox messages.",
-            })
+            }
+            messages.append(msg_ack)
+            _log_msg_append(messages)
+        log.debug("LEAD Round %d msgs=%d", _agent_round, len(messages))
+        t0 = time.perf_counter()
         response = client.chat.completions.create(
             model=MODEL, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        elapsed = time.perf_counter() - t0
         message = response.choices[0].message
         tool_calls = message.tool_calls or []
-        
+        log.debug("LEAD LLM <<< elapsed=%.2fs stop=%s tool_calls=%d",
+                  elapsed, response.choices[0].finish_reason, len(tool_calls))
+
         assistant_msg = {
             "role": "assistant",
             "content": message.content or ""  # 或者条件过滤掉 content 键
@@ -832,18 +989,25 @@ def agent_loop(messages: list):
             ]
 
         messages.append(assistant_msg)
-        
+        _log_msg_append(messages)
+
         if not tool_calls:
+            log.info("LEAD done (no tool_calls) round=%d", _agent_round)
             return message.content
-        
+
         for tool_call in tool_calls:
             assert tool_call.id is not None
             args = json.loads(tool_call.function.arguments or "{}")
             handler = TOOL_HANDLERS.get(tool_call.function.name)
+            log.debug("LEAD TOOL >>> %s args=%s", tool_call.function.name, str(args)[:120])
+            t1 = time.perf_counter()
             try:
                 output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
             except Exception as e:
+                log.error("LEAD TOOL <<< %s EXCEPTION: %s", tool_call.function.name, e)
                 output = f"Error: {e}"
+            log.debug("LEAD TOOL <<< %s elapsed=%.2fs out=%r",
+                      tool_call.function.name, time.perf_counter() - t1, str(output)[:80])
             print(f"> {tool_call.function.name}: {output[:200]}")
             messages.append({
                 "role": "tool",
@@ -851,11 +1015,14 @@ def agent_loop(messages: list):
                 "name": tool_call.function.name,
                 "content": str(output)
             })
+            _log_msg_append(messages)
   
 if __name__ == "__main__":
+    log.info("Agent started model=%s workdir=%s", MODEL, WORKDIR)
     history = [
     {"role": "system", "content": SYSTEM}
 ]
+    _log_msg_append(history)
     while True:
         try:
             query = input("\033[36ms11 >> \033[0m")
@@ -877,6 +1044,10 @@ if __name__ == "__main__":
                 owner = f" @{t['owner']}" if t.get("owner") else ""
                 print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
+        log.info("USER >>> %r", query[:120])
         history.append({"role": "user", "content": query})
+        _log_msg_append(history)
         response_content = agent_loop(history)
+        log.info("AGENT <<< %r", str(response_content)[:120])
         print(response_content)
+    log.info("Agent exited")
