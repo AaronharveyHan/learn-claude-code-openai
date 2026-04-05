@@ -31,6 +31,7 @@ Key insight: "The agent can forget strategically and keep working forever."
 """
 import os
 import json
+import tempfile
 import time
 import logging
 import subprocess
@@ -70,6 +71,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -87,15 +89,29 @@ client = OpenAI(
             )
 MODEL = os.getenv("llm_model","qwen3.5-plus")
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks.When calling compact, always provide a focus describing what must be preserved."
-MODEL_CONTEXT_WINDOW = 131072   # qwen3.5-plus 128K
-MAX_TOKENS = 8000               # 单次生成上限
-ESTIMATE_MARGIN = 0.8           # chars//4 粗估，留 20% 误差缓冲
+MODEL_CONTEXT_WINDOW = int(os.getenv("llm_context_window", "131072"))
+MAX_TOKENS          = int(os.getenv("llm_max_tokens",      "8000"))
+ESTIMATE_MARGIN     = float(os.getenv("llm_estimate_margin", "0.8"))
 THRESHOLD = int((MODEL_CONTEXT_WINDOW - MAX_TOKENS) * ESTIMATE_MARGIN)
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
-def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
-    return len(json.dumps(messages, ensure_ascii=False)) // 4
+
+# ── Token 计数：优先用 tiktoken，不可用时降级到字符估算 ──────────────────────
+# tiktoken 对英文精确，对中文也比 //4 准确（中文单字通常 1-2 token）
+# 安装：pip install tiktoken
+try:
+    import tiktoken
+    _enc = tiktoken.get_encoding("cl100k_base")
+    def estimate_tokens(messages: list) -> int:
+        """Token count via tiktoken (cl100k_base encoding)."""
+        return len(_enc.encode(json.dumps(messages, ensure_ascii=False)))
+    log.debug("TOKENS tiktoken available, using cl100k_base encoder")
+except ImportError:
+    def estimate_tokens(messages: list) -> int:
+        """Fallback: ~4 chars per token (underestimates CJK by ~3x)."""
+        return len(json.dumps(messages, ensure_ascii=False)) // 4
+    log.warning("TOKENS tiktoken not installed, using char//4 fallback "
+                "(inaccurate for CJK). Run: pip install tiktoken")
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
 def micro_compact(messages: list) -> list:
     # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
@@ -157,8 +173,14 @@ def auto_compact(messages: list, focus: str = None) -> list:
     summary = response.choices[0].message.content or ""
     log.info("AUTO  summarized (%.2fs) summary_len=%d", elapsed, len(summary))
     # Replace all messages with compressed summary
-    new_messages = [
+    # 从当前 messages 提取实际 system message（可能已被运行时修改），
+    # 而非直接使用模块级常量 SYSTEM，确保压缩后身份不丢失。
+    system_msg = next(
+        (m for m in messages if m.get("role") == "system"),
         {"role": "system", "content": SYSTEM},
+    )
+    new_messages = [
+        system_msg,
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
@@ -213,7 +235,15 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -230,7 +260,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in content:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text, 1))
+        new_content = content.replace(old_text, new_text, 1)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)

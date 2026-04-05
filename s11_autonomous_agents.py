@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -40,6 +41,8 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+_shutdown = threading.Event()   # C1: 优雅退出信号，主程序退出时 set()
 # ── Logger setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "agent_debug.log"
 
@@ -71,6 +74,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -89,6 +93,18 @@ MODEL = os.getenv("llm_model","qwen3.5-plus")
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
+
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
@@ -219,7 +235,7 @@ def claim_task(task_id: int | str, owner: str) -> str:
             return f"Error: Task {task_id} already claimed by {task.get('owner')}"
         task["owner"] = owner
         task["status"] = "in_progress"
-        path.write_text(json.dumps(task, indent=2))
+        _atomic_write(path, json.dumps(task, indent=2))
     log.info("TASK claim task_id=%d owner=%s subject=%r", task_id, owner, task.get("subject","")[:60])
     return f"Claimed task #{task_id} for {owner}"
 # -- Identity re-injection after compression --
@@ -242,7 +258,7 @@ class TeammateManager:
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
     def _save_config(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
+        _atomic_write(self.config_path, json.dumps(self.config, indent=2))
     def _find_member(self, name: str) -> dict:
         for m in self.config["members"]:
             if m["name"] == name:
@@ -272,11 +288,18 @@ class TeammateManager:
         thread = threading.Thread(
             target=self._loop,
             args=(name, role, prompt),
-            daemon=True,
+            daemon=False,
         )
         self.threads[name] = thread
         thread.start()
         return f"Spawned '{name}' (role: {role})"
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Signal all threads to stop and wait for them to finish."""
+        _shutdown.set()
+        for name, t in list(self.threads.items()):
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("TEAM shutdown: '%s' still alive after %.1fs", name, timeout)
     def _loop(self, name: str, role: str, prompt: str):
         team_name = self.config["team_name"]
         sys_prompt = (
@@ -289,7 +312,7 @@ class TeammateManager:
         tools = self._teammate_tools()
         log.info("[%s] loop started role=%s team=%s", name, role, team_name)
         work_cycle = 0
-        while True:
+        while not _shutdown.is_set():
             work_cycle += 1
             log.debug("[%s] WORK cycle=%d msgs=%d", name, work_cycle, len(messages))
             # -- WORK PHASE: standard agent loop --
@@ -378,7 +401,7 @@ class TeammateManager:
             resume = False
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
             for poll_i in range(polls):
-                time.sleep(POLL_INTERVAL)
+                _shutdown.wait(timeout=POLL_INTERVAL)   # 可被 shutdown 信号立即唤醒
                 inbox = BUS.read_inbox(name)
                 if inbox:
                     log.info("[%s] IDLE inbox msg count=%d at poll=%d", name, len(inbox), poll_i + 1)
@@ -454,7 +477,7 @@ class TeammateManager:
             return f"Shutdown {'approved' if approve else 'rejected'}"
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
-            req_id = str(uuid.uuid4())[:8]
+            req_id = str(uuid.uuid4())
             with _tracker_lock:
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
             log.info("PROTO plan_approval sender=%s req_id=%s plan=%r", sender, req_id, plan_text[:80])
@@ -669,7 +692,7 @@ def _run_write(path: str, content: str) -> str:
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        _atomic_write(fp, content)
         result = f"Wrote {len(content)} bytes"
     except Exception as e:
         log.error("WRITE <<< ERROR path=%s: %s", path, e)
@@ -685,7 +708,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< text not found path=%s old=%r", path, old_text[:40])
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        _atomic_write(fp, c.replace(old_text, new_text, 1))
         result = f"Edited {path}"
     except Exception as e:
         log.error("EDIT  <<< ERROR path=%s: %s", path, e)
@@ -694,7 +717,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
     return result
 # -- Lead-specific protocol handlers --
 def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
+    req_id = str(uuid.uuid4())
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
     log.info("PROTO shutdown_request req_id=%s target=%s", req_id, teammate)
@@ -1050,4 +1073,6 @@ if __name__ == "__main__":
         response_content = agent_loop(history)
         log.info("AGENT <<< %r", str(response_content)[:120])
         print(response_content)
+    log.info("Shutting down teammate threads...")
+    TEAM.shutdown(timeout=5)
     log.info("Agent exited")

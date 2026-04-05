@@ -19,8 +19,10 @@ before each LLM call to deliver results.
                  +-- notification queue --> [results injected]
 Key insight: "Fire and forget -- the agent doesn't block while the command runs."
 """
+import atexit
 import json
 import os
+import tempfile
 import time
 import logging
 import subprocess
@@ -62,6 +64,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -79,22 +82,44 @@ client = OpenAI(
             )
 MODEL = os.getenv("llm_model","qwen3.5-plus")
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 # -- BackgroundManager: threaded execution + notification queue --
 class BackgroundManager:
     def __init__(self):
         self.tasks = {}  # task_id -> {status, result, command}
         self._notification_queue = []  # completed task results
         self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
     def run(self, command: str) -> str:
         """Start a background thread, return task_id immediately."""
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
         thread = threading.Thread(
-            target=self._execute, args=(task_id, command), daemon=True
+            target=self._execute, args=(task_id, command), daemon=False
         )
+        with self._lock:
+            self._threads.append(thread)
         thread.start()
         log.info("BG    >>> task_id=%s command=%s", task_id, command[:80])
         return f"Background task {task_id} started: {command[:80]}"
+    def join_all(self, timeout: float = 5.0) -> None:
+        """Wait for all background threads to finish (called on program exit)."""
+        with self._lock:
+            threads = list(self._threads)
+        for t in threads:
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("BG    join_all: thread still alive after %.1fs timeout", timeout)
     def _execute(self, task_id: str, command: str):
         """Thread target: run subprocess, capture output, push to queue."""
         t0 = time.perf_counter()
@@ -149,6 +174,7 @@ class BackgroundManager:
                      len(notifs), [n["task_id"] for n in notifs])
         return notifs
 BG = BackgroundManager()
+atexit.register(BG.join_all)   # 主进程异常退出时也确保后台线程完成写盘
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -196,7 +222,7 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        _atomic_write(fp, content)
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -213,7 +239,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        _atomic_write(fp, c.replace(old_text, new_text, 1))
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)
@@ -438,4 +464,6 @@ if __name__ == "__main__":
         _log_msg_append(history, user_msg)
         response_content = agent_loop(history)
         print(response_content)
+    log.info("Waiting for background tasks to finish...")
+    BG.join_all(timeout=5)
     log.info("Agent exited.")

@@ -18,8 +18,10 @@ Key insight: "State that survives compression -- because it's outside the conver
 """
 import json
 import os
+import tempfile
 import time
 import logging
+import threading
 import subprocess
 from pathlib import Path
 from openai import OpenAI
@@ -57,6 +59,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -75,11 +78,25 @@ client = OpenAI(
 MODEL = os.getenv("llm_model","qwen3.5-plus")
 TASKS_DIR = WORKDIR / ".tasks"
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
+
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
         self.dir.mkdir(exist_ok=True)
+        self._lock = threading.Lock()
         self._next_id = self._max_id() + 1
     def _max_id(self) -> int:
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
@@ -91,15 +108,16 @@ class TaskManager:
         return json.loads(path.read_text())
     def _save(self, task: dict):
         path = self.dir / f"task_{task['id']}.json"
-        path.write_text(json.dumps(task, indent=2))
+        _atomic_write(path, json.dumps(task, indent=2))
     def create(self, subject: str, description: str = "") -> str:
-        task = {
-            "id": self._next_id, "subject": subject, "description": description,
-            "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
-        }
-        self._save(task)
-        log.info("TASK  create id=%d subject=%s", task["id"], subject)
-        self._next_id += 1
+        with self._lock:
+            task = {
+                "id": self._next_id, "subject": subject, "description": description,
+                "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
+            }
+            self._save(task)
+            log.info("TASK  create id=%d subject=%s", task["id"], subject)
+            self._next_id += 1
         return json.dumps(task, indent=2)
     def get(self, task_id: int) -> str:
         log.debug("TASK  get id=%d", task_id)
@@ -213,7 +231,15 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -230,7 +256,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        new_content = c.replace(old_text, new_text, 1)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)

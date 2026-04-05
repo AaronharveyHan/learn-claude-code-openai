@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -46,6 +47,8 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+_shutdown = threading.Event()   # C1: 优雅退出信号，主程序退出时 set()
 # ── Logger setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "agent_debug.log"
 
@@ -77,6 +80,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -96,6 +100,18 @@ MODEL = os.getenv("llm_model","qwen3.5-plus")
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 SYSTEM = f"You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes."
+
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -108,6 +124,15 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._locks: dict[str, threading.Lock] = {}
+        self._meta_lock = threading.Lock()   # 保护 _locks 字典本身
+
+    def _get_lock(self, name: str) -> threading.Lock:
+        with self._meta_lock:
+            if name not in self._locks:
+                self._locks[name] = threading.Lock()
+            return self._locks[name]
+
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
         if msg_type not in VALID_MSG_TYPES:
@@ -122,20 +147,27 @@ class MessageBus:
         if extra:
             msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"
-        with open(inbox_path, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with self._get_lock(to):
+            with open(inbox_path, "a") as f:
+                f.write(json.dumps(msg) + "\n")
         log.info("MSG   send: %s -> %s [%s] content=%s", sender, to, msg_type, content[:60])
         return f"Sent {msg_type} to {to}"
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
-        if not inbox_path.exists():
-            log.debug("MSG   read_inbox: %s inbox empty (no file)", name)
-            return []
+        with self._get_lock(name):
+            if not inbox_path.exists():
+                log.debug("MSG   read_inbox: %s inbox empty (no file)", name)
+                return []
+            raw = inbox_path.read_text()
+            inbox_path.write_text("")          # 清空紧跟读，中间不会被 send 插入
         messages = []
-        for line in inbox_path.read_text().strip().splitlines():
+        for line in raw.strip().splitlines():
             if line:
-                messages.append(json.loads(line))
-        inbox_path.write_text("")
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    log.warning("MSG   read_inbox: %s skipping corrupt line (%s): %.80r",
+                                name, exc, line)
         if messages:
             log.info("MSG   read_inbox: %s drained %d message(s)", name, len(messages))
         else:
@@ -165,7 +197,7 @@ class TeammateManager:
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
     def _save_config(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
+        _atomic_write(self.config_path, json.dumps(self.config, indent=2))
     def _find_member(self, name: str) -> dict:
         for m in self.config["members"]:
             if m["name"] == name:
@@ -190,12 +222,19 @@ class TeammateManager:
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
-            daemon=True,
+            daemon=False,
         )
         self.threads[name] = thread
         thread.start()
         log.info("TEAM  spawn: thread started for '%s'", name)
         return f"Spawned '{name}' (role: {role})"
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Signal all threads to stop and wait for them to finish."""
+        _shutdown.set()
+        for name, t in list(self.threads.items()):
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("TEAM  shutdown: '%s' still alive after %.1fs", name, timeout)
     def _teammate_loop(self, name: str, role: str, prompt: str):
         log.info("[%s] loop started role=%s prompt=%s", name, role, prompt[:60])
         sys_prompt = (
@@ -207,9 +246,12 @@ class TeammateManager:
         first_run = True
         round_num = 0
         for _ in range(50):
+            if _shutdown.is_set():
+                log.info("[%s] shutdown signal received, exiting", name)
+                break
             inbox = BUS.read_inbox(name)
             if not first_run and not inbox:
-                time.sleep(1)
+                _shutdown.wait(timeout=1)   # 可被 shutdown 信号立即唤醒
                 continue
             first_run = False
             for msg in inbox:
@@ -452,7 +494,7 @@ def _run_write(path: str, content: str) -> str:
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        _atomic_write(fp, content)
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -469,7 +511,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        _atomic_write(fp, c.replace(old_text, new_text, 1))
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)
@@ -759,4 +801,6 @@ if __name__ == "__main__":
         _log_msg_append(history, user_msg)
         response_content = agent_loop(history)
         print(response_content)
+    log.info("Shutting down teammate threads...")
+    TEAM.shutdown(timeout=5)
     log.info("Agent exited.")

@@ -22,6 +22,7 @@ import os
 import json
 import time
 import logging
+import tempfile
 import subprocess
 from pathlib import Path
 from openai import OpenAI
@@ -59,6 +60,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -124,7 +126,15 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -141,7 +151,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in content:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text, 1))
+        new_content = content.replace(old_text, new_text, 1)
+        fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            os.replace(tmp, fp)
+        except:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)

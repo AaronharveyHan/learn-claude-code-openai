@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from openai import OpenAI
@@ -66,6 +67,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -97,6 +99,19 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
+
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Use task + worktree tools for multi-task work. "
@@ -161,7 +176,7 @@ class TaskManager:
             raise ValueError(f"Task {task_id} not found")
         return json.loads(path.read_text())
     def _save(self, task: dict):
-        self._path(task["id"]).write_text(json.dumps(task, indent=2))
+        _atomic_write(self._path(task["id"]), json.dumps(task, indent=2))
     def create(self, subject: str, description: str = "") -> str:
         task = {
             "id": self._next_id,
@@ -247,7 +262,7 @@ class WorktreeManager:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.dir / "index.json"
         if not self.index_path.exists():
-            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
+            _atomic_write(self.index_path, json.dumps({"worktrees": []}, indent=2))
         self.git_available = self._is_git_repo()
     def _is_git_repo(self) -> bool:
         try:
@@ -278,7 +293,7 @@ class WorktreeManager:
     def _load_index(self) -> dict:
         return json.loads(self.index_path.read_text())
     def _save_index(self, data: dict):
-        self.index_path.write_text(json.dumps(data, indent=2))
+        _atomic_write(self.index_path, json.dumps(data, indent=2))
     def _find(self, name: str) -> dict | None:
         idx = self._load_index()
         for wt in idx.get("worktrees", []):
@@ -553,7 +568,7 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        _atomic_write(fp, content)
         result = f"Wrote {len(content)} bytes"
     except Exception as e:
         log.error("WRITE <<< ERROR path=%s: %s", path, e)
@@ -569,7 +584,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< text not found path=%s old=%r", path, old_text[:40])
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        _atomic_write(fp, c.replace(old_text, new_text, 1))
         result = f"Edited {path}"
     except Exception as e:
         log.error("EDIT  <<< ERROR path=%s: %s", path, e)

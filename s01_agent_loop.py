@@ -61,6 +61,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
  
     # 文件 handler（纯文本，DEBUG+）
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
  

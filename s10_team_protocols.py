@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -50,6 +51,8 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+_shutdown = threading.Event()   # C1: 优雅退出信号，主程序退出时 set()
 # ── Logger setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "agent_debug.log"
 
@@ -81,6 +84,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
     ch.setFormatter(ColorFormatter(fmt, datefmt))
 
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    os.chmod(LOG_FILE, 0o600)   # 仅 owner 可读写，防止 LLM 响应内容被同机其他用户读取
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
 
@@ -99,6 +103,19 @@ client = OpenAI(
 MODEL = os.getenv("llm_model","qwen3.5-plus")
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
+
+def _atomic_write(path: Path, content: str) -> None:
+    """先写临时文件再 rename，防止崩溃时文件损坏。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
 SYSTEM = (
     f"You are a team lead at {WORKDIR}. "
     f"Manage teammates with shutdown and plan approval protocols. "
@@ -115,14 +132,53 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 # -- Request trackers: correlate by request_id --
-shutdown_requests = {}
-plan_requests = {}
+_SHUTDOWN_REQ_FILE = TEAM_DIR / "shutdown_requests.json"
+_PLAN_REQ_FILE     = TEAM_DIR / "plan_requests.json"
+
+_TRACKER_TTL = 3600  # 非 pending 请求保留 1 小时后清理
+
+def _load_tracker(path: Path) -> dict:
+    """从 JSON 文件加载状态，同时清理超过 TTL 的已完结请求。"""
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cutoff = time.time() - _TRACKER_TTL
+            cleaned = {
+                k: v for k, v in data.items()
+                if v.get("status") == "pending"
+                or v.get("created_at", 0) >= cutoff
+            }
+            if len(cleaned) != len(data):
+                log.debug("TRACKER pruned %d stale entries from %s",
+                          len(data) - len(cleaned), path.name)
+            return cleaned
+    except Exception as e:
+        log.warning("TRACKER load failed %s: %s", path, e)
+    return {}
+
+def _save_tracker(path: Path, data: dict) -> None:
+    """原子写入 tracker 状态到 JSON 文件（需在 _tracker_lock 内调用）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+TEAM_DIR.mkdir(parents=True, exist_ok=True)
+shutdown_requests: dict = _load_tracker(_SHUTDOWN_REQ_FILE)
+plan_requests: dict     = _load_tracker(_PLAN_REQ_FILE)
 _tracker_lock = threading.Lock()
 # -- MessageBus: JSONL inbox per teammate --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._locks: dict[str, threading.Lock] = {}
+        self._meta_lock = threading.Lock()   # 保护 _locks 字典本身
+
+    def _get_lock(self, name: str) -> threading.Lock:
+        with self._meta_lock:
+            if name not in self._locks:
+                self._locks[name] = threading.Lock()
+            return self._locks[name]
+
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
         if msg_type not in VALID_MSG_TYPES:
@@ -137,20 +193,23 @@ class MessageBus:
         if extra:
             msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"
-        with open(inbox_path, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with self._get_lock(to):
+            with open(inbox_path, "a") as f:
+                f.write(json.dumps(msg) + "\n")
         log.info("MSG   send: %s -> %s [%s] content=%s", sender, to, msg_type, content[:60])
         return f"Sent {msg_type} to {to}"
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
-        if not inbox_path.exists():
-            log.debug("MSG   read_inbox: %s inbox empty (no file)", name)
-            return []
+        with self._get_lock(name):
+            if not inbox_path.exists():
+                log.debug("MSG   read_inbox: %s inbox empty (no file)", name)
+                return []
+            raw = inbox_path.read_text()
+            inbox_path.write_text("")          # 清空紧跟读，中间不会被 send 插入
         messages = []
-        for line in inbox_path.read_text().strip().splitlines():
+        for line in raw.strip().splitlines():
             if line:
                 messages.append(json.loads(line))
-        inbox_path.write_text("")
         if messages:
             log.info("MSG   read_inbox: %s drained %d message(s)", name, len(messages))
         else:
@@ -179,7 +238,7 @@ class TeammateManager:
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
     def _save_config(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
+        _atomic_write(self.config_path, json.dumps(self.config, indent=2))
     def _find_member(self, name: str) -> dict:
         for m in self.config["members"]:
             if m["name"] == name:
@@ -204,12 +263,19 @@ class TeammateManager:
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
-            daemon=True,
+            daemon=False,
         )
         self.threads[name] = thread
         thread.start()
         log.info("TEAM  spawn: thread started for '%s'", name)
         return f"Spawned '{name}' (role: {role})"
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Signal all threads to stop and wait for them to finish."""
+        _shutdown.set()
+        for name, t in list(self.threads.items()):
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("TEAM  shutdown: '%s' still alive after %.1fs", name, timeout)
     def _teammate_loop(self, name: str, role: str, prompt: str):
         log.info("[%s] loop started role=%s prompt=%s", name, role, prompt[:60])
         sys_prompt = (
@@ -223,9 +289,12 @@ class TeammateManager:
         first_run = True
         round_num = 0
         for _ in range(50):
+            if _shutdown.is_set():
+                log.info("[%s] shutdown signal received, exiting", name)
+                break
             inbox = BUS.read_inbox(name)
             if not first_run and not inbox:
-                time.sleep(1)
+                _shutdown.wait(timeout=1)   # 可被 shutdown 信号立即唤醒
                 continue
             first_run = False
             for msg in inbox:
@@ -332,6 +401,7 @@ class TeammateManager:
                 if req_id in shutdown_requests:
                     old = shutdown_requests[req_id]["status"]
                     shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+                    _save_tracker(_SHUTDOWN_REQ_FILE, shutdown_requests)
                     log.info("PROTO shutdown_response: req_id=%s %s->%s by %s",
                              req_id, old, shutdown_requests[req_id]["status"], sender)
                 else:
@@ -344,9 +414,10 @@ class TeammateManager:
             return f"Shutdown {'approved' if approve else 'rejected'}"
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
-            req_id = str(uuid.uuid4())[:8]
+            req_id = str(uuid.uuid4())
             with _tracker_lock:
-                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending", "created_at": time.time()}
+                _save_tracker(_PLAN_REQ_FILE, plan_requests)
             log.info("PROTO plan_approval: req_id=%s from=%s plan=%s", req_id, sender, plan_text[:60])
             BUS.send(
                 sender, "lead", plan_text, "plan_approval",
@@ -544,7 +615,7 @@ def _run_write(path: str, content: str) -> str:
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        _atomic_write(fp, content)
         result = f"Wrote {len(content)} bytes"
         elapsed = time.perf_counter() - t0
         log.debug("WRITE <<< (%.2fs) %s", elapsed, result)
@@ -561,7 +632,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         if old_text not in c:
             log.warning("EDIT  <<< Text not found in %s", path)
             return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        _atomic_write(fp, c.replace(old_text, new_text, 1))
         result = f"Edited {path}"
         elapsed = time.perf_counter() - t0
         log.debug("EDIT  <<< (%.2fs) %s", elapsed, result)
@@ -571,9 +642,10 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 # -- Lead-specific protocol handlers --
 def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
+    req_id = str(uuid.uuid4())
     with _tracker_lock:
-        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending", "created_at": time.time()}
+        _save_tracker(_SHUTDOWN_REQ_FILE, shutdown_requests)
     log.info("PROTO shutdown_request: req_id=%s -> '%s' status=pending", req_id, teammate)
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
@@ -588,6 +660,7 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
         return f"Error: Unknown plan request_id '{request_id}'"
     with _tracker_lock:
         req["status"] = "approved" if approve else "rejected"
+        _save_tracker(_PLAN_REQ_FILE, plan_requests)
     log.info("PROTO plan_review: req_id=%s from=%s status=%s feedback=%s",
              request_id, req["from"], req["status"], feedback[:60])
     BUS.send(
@@ -945,4 +1018,6 @@ if __name__ == "__main__":
         _log_msg_append(history, user_msg)
         response_content = agent_loop(history)
         print(response_content)
+    log.info("Shutting down teammate threads...")
+    TEAM.shutdown(timeout=5)
     log.info("Agent exited.")
