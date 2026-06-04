@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>learn-claude-code-openai 项目分析报告</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #7c6af7;
+      --accent2: #38bdf8;
+      --accent3: #34d399;
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --text: #e2e8f0;
+      --text-muted: #8892a4;
+      --text-dim: #4a5568;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, #1a1d27 0%, #12151f 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 2.5rem 2rem 2rem;
+      position: relative;
+      overflow: hidden;
+    }
+    header::before {
+      content: '';
+      position: absolute;
+      top: -60px; left: -60px;
+      width: 300px; height: 300px;
+      background: radial-gradient(circle, rgba(124,106,247,0.15) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .header-inner { max-width: 1100px; margin: 0 auto; }
+    header h1 { font-size: 1.9rem; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
+    header h1 span { color: var(--accent); }
+    .header-meta {
+      margin-top: 0.6rem;
+      display: flex; gap: 1.5rem; flex-wrap: wrap;
+      color: var(--text-muted); font-size: 0.85rem;
+    }
+    .header-meta span { display: flex; align-items: center; gap: 0.3rem; }
+    .badge {
+      display: inline-block; padding: 0.2rem 0.6rem;
+      border-radius: 99px; font-size: 0.75rem; font-weight: 600;
+      background: rgba(124,106,247,0.2); color: var(--accent);
+      border: 1px solid rgba(124,106,247,0.3);
+    }
+    .badge.green { background: rgba(52,211,153,0.15); color: var(--accent3); border-color: rgba(52,211,153,0.3); }
+    .badge.blue  { background: rgba(56,189,248,0.15); color: var(--accent2); border-color: rgba(56,189,248,0.3); }
+    .badge.warn  { background: rgba(251,191,36,0.15); color: var(--warn);    border-color: rgba(251,191,36,0.3); }
+    .badge.danger{ background: rgba(248,113,113,0.15); color: var(--danger); border-color: rgba(248,113,113,0.3); }
+
+    /* ── Layout ── */
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+    section { margin-bottom: 2.5rem; }
+    h2 {
+      font-size: 1.1rem; font-weight: 700; color: #fff;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1.2rem;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    h2 .ico { font-size: 1.1em; }
+    h3 { font-size: 0.95rem; font-weight: 600; color: var(--accent2); margin-bottom: 0.6rem; }
+
+    /* ── Stat cards ── */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 1rem;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.2rem 1rem;
+      text-align: center;
+      transition: border-color 0.2s;
+    }
+    .stat-card:hover { border-color: var(--accent); }
+    .stat-card .num {
+      font-size: 2rem; font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .stat-card .label { font-size: 0.78rem; color: var(--text-muted); margin-top: 0.2rem; }
+
+    /* ── Module table ── */
+    .module-table { width: 100%; border-collapse: collapse; }
+    .module-table thead th {
+      background: var(--surface2); color: var(--text-muted);
+      font-size: 0.78rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.05em; padding: 0.6rem 0.8rem; text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .module-table tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    .module-table tbody tr:hover { background: var(--surface2); }
+    .module-table td { padding: 0.65rem 0.8rem; font-size: 0.85rem; vertical-align: middle; }
+    .module-table td:first-child { font-family: 'Fira Code', 'Cascadia Code', monospace; color: var(--accent2); }
+    .module-tag {
+      display: inline-block; font-size: 0.7rem; font-weight: 600;
+      padding: 0.15rem 0.45rem; border-radius: 4px; margin-left: 0.4rem;
+    }
+    .tag-new    { background: rgba(52,211,153,0.15); color: var(--accent3); }
+    .tag-core   { background: rgba(124,106,247,0.15); color: var(--accent); }
+    .tag-adv    { background: rgba(251,191,36,0.15);  color: var(--warn); }
+
+    .bar-wrap { display: flex; align-items: center; gap: 0.5rem; }
+    .bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+    .bar-num { font-size: 0.78rem; color: var(--text-muted); min-width: 2.5rem; text-align: right; }
+
+    /* ── Architecture layers ── */
+    .layer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 680px) { .layer-grid { grid-template-columns: 1fr; } }
+    .layer-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1.1rem;
+    }
+    .layer-card h3 { margin-bottom: 0.5rem; }
+    .layer-card ul { padding-left: 1rem; }
+    .layer-card li { font-size: 0.83rem; color: var(--text-muted); margin-bottom: 0.25rem; }
+    .layer-card li span { color: var(--accent2); font-family: monospace; }
+
+    /* ── Arch diagram ── */
+    .arch-diagram {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1.4rem;
+      font-family: 'Fira Code', monospace; font-size: 0.82rem;
+      color: var(--text-muted); line-height: 1.8;
+      overflow-x: auto;
+    }
+    .arch-diagram .hi  { color: var(--accent); }
+    .arch-diagram .hi2 { color: var(--accent2); }
+    .arch-diagram .hi3 { color: var(--accent3); }
+    .arch-diagram .hw  { color: var(--warn); }
+
+    /* ── Issue / suggestion cards ── */
+    .issue-list { display: flex; flex-direction: column; gap: 0.8rem; }
+    .issue-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-left: 3px solid var(--border);
+      border-radius: 8px; padding: 1rem 1.1rem;
+    }
+    .issue-card.high   { border-left-color: var(--danger); }
+    .issue-card.medium { border-left-color: var(--warn); }
+    .issue-card.low    { border-left-color: var(--accent3); }
+    .issue-card .title { font-weight: 600; color: #fff; font-size: 0.9rem; margin-bottom: 0.3rem; }
+    .issue-card .desc  { font-size: 0.82rem; color: var(--text-muted); line-height: 1.5; }
+    .issue-card .files { margin-top: 0.5rem; font-size: 0.78rem; color: var(--text-dim); font-family: monospace; }
+    .pill {
+      display: inline-block; padding: 0.12rem 0.5rem; border-radius: 4px;
+      font-size: 0.7rem; font-weight: 700; margin-right: 0.4rem;
+    }
+    .pill.high   { background: rgba(248,113,113,0.2); color: var(--danger); }
+    .pill.medium { background: rgba(251,191,36,0.2);  color: var(--warn); }
+    .pill.low    { background: rgba(52,211,153,0.2);  color: var(--accent3); }
+
+    /* ── Git history ── */
+    .commit-list { list-style: none; }
+    .commit-list li {
+      display: flex; gap: 1rem; align-items: flex-start;
+      padding: 0.7rem 0; border-bottom: 1px solid var(--border);
+      font-size: 0.84rem;
+    }
+    .commit-hash { font-family: monospace; color: var(--accent); min-width: 4.5rem; }
+    .commit-msg  { color: var(--text); flex: 1; }
+
+    /* ── Duplication section ── */
+    .dup-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.8rem; }
+    .dup-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 0.9rem;
+    }
+    .dup-card .fn  { font-family: monospace; color: var(--accent2); font-size: 0.83rem; margin-bottom: 0.3rem; }
+    .dup-card .cnt { font-size: 1.4rem; font-weight: 700; color: var(--warn); }
+    .dup-card .sub { font-size: 0.75rem; color: var(--text-muted); }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center; padding: 1.5rem;
+      color: var(--text-dim); font-size: 0.78rem;
+      border-top: 1px solid var(--border); margin-top: 3rem;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════ HEADER ═══════════════════════════ -->
+<header>
+  <div class="header-inner">
+    <h1>learn-claude-code-<span>openai</span> &nbsp;项目分析报告</h1>
+    <div class="header-meta">
+      <span>&#128197; 生成日期：2026-06-04</span>
+      <span>&#127981; 分支：<code>claude/analyze-project-8sXmX</code></span>
+      <span>&#128196; 最新提交：<code>3abd5af</code> — Secure logs, atomic writes, threading fixes</span>
+      <span><span class="badge green">Python 3.10+</span></span>
+      <span><span class="badge blue">OpenAI 兼容协议</span></span>
+      <span><span class="badge">DashScope / 千问</span></span>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <!-- ═══════════════ OVERVIEW STATS ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128202;</span> 总体概况</h2>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="num">14</div>
+        <div class="label">可执行脚本</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">6,856</div>
+        <div class="label">总代码行数</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">124</div>
+        <div class="label">定义的函数</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">26</div>
+        <div class="label">定义的类</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">135</div>
+        <div class="label">工具定义总数</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">6</div>
+        <div class="label">Git 提交记录</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ MODULE TABLE ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128218;</span> 模块一览</h2>
+    <div style="overflow-x:auto; background:var(--surface); border:1px solid var(--border); border-radius:10px;">
+      <table class="module-table">
+        <thead>
+          <tr>
+            <th>文件</th>
+            <th>主题</th>
+            <th>代码行数</th>
+            <th>函数数</th>
+            <th>工具数</th>
+            <th>层级</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>s01_agent_loop.py</td>
+            <td>Agent 循环核心：while + tool_use + messages</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:18%"></div></div>
+                <span class="bar-num">224</span>
+              </div>
+            </td>
+            <td>5</td><td>1</td>
+            <td><span class="badge green">基础</span></td>
+          </tr>
+          <tr>
+            <td>s02_tool_use.py</td>
+            <td>多工具扩展：bash / read / write / edit</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:25%"></div></div>
+                <span class="bar-num">340</span>
+              </div>
+            </td>
+            <td>9</td><td>4</td>
+            <td><span class="badge green">基础</span></td>
+          </tr>
+          <tr>
+            <td>s03_todo_write.py</td>
+            <td>TodoWrite：任务列表工具 + 久未更新提醒</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:32%"></div></div>
+                <span class="bar-num">440</span>
+              </div>
+            </td>
+            <td>9</td><td>5</td>
+            <td><span class="badge green">基础</span></td>
+          </tr>
+          <tr>
+            <td>s04_subagent.py</td>
+            <td>子智能体：独立上下文 + 只返回摘要给父</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:32%"></div></div>
+                <span class="bar-num">441</span>
+              </div>
+            </td>
+            <td>10</td><td>5</td>
+            <td><span class="badge blue">隔离</span></td>
+          </tr>
+          <tr>
+            <td>s05_skill_loading.py</td>
+            <td>Skills：系统提示只放元数据，按需注入全文</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:32%"></div></div>
+                <span class="bar-num">439</span>
+              </div>
+            </td>
+            <td>9</td><td>5</td>
+            <td><span class="badge blue">隔离</span></td>
+          </tr>
+          <tr>
+            <td>s06_context_compact.py</td>
+            <td>上下文压缩三层策略：micro / auto / manual</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:37%"></div></div>
+                <span class="bar-num">506</span>
+              </div>
+            </td>
+            <td>11</td><td>5</td>
+            <td><span class="badge blue">隔离</span></td>
+          </tr>
+          <tr>
+            <td>s07_task_system.py</td>
+            <td>任务系统：.tasks/JSON 持久化 + 依赖图</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:38%"></div></div>
+                <span class="bar-num">521</span>
+              </div>
+            </td>
+            <td>10</td><td>8</td>
+            <td><span class="badge warn">持久</span></td>
+          </tr>
+          <tr>
+            <td>s08_background_tasks.py</td>
+            <td>后台任务：线程执行长命令 + 完成通知拉取</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:34%"></div></div>
+                <span class="bar-num">469</span>
+              </div>
+            </td>
+            <td>10</td><td>6</td>
+            <td><span class="badge warn">持久</span></td>
+          </tr>
+          <tr>
+            <td>s09_agent_teams.py</td>
+            <td>团队：命名成员 + JSONL 收件箱通信 + 线程</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:59%"></div></div>
+                <span class="bar-num">805</span>
+              </div>
+            </td>
+            <td>10</td><td>13</td>
+            <td><span class="badge" style="background:rgba(248,113,113,0.15);color:var(--danger);border-color:rgba(248,113,113,0.3)">协作</span></td>
+          </tr>
+          <tr>
+            <td>s10_team_protocols.py</td>
+            <td>团队协议：关闭流程 + 计划审批 + request_id</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:75%"></div></div>
+                <span class="bar-num">1022</span>
+              </div>
+            </td>
+            <td>15</td><td>19</td>
+            <td><span class="badge" style="background:rgba(248,113,113,0.15);color:var(--danger);border-color:rgba(248,113,113,0.3)">协作</span></td>
+          </tr>
+          <tr>
+            <td>s11_autonomous_agents.py</td>
+            <td>自治代理：空闲轮询任务板 + 身份再注入</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:79%"></div></div>
+                <span class="bar-num">1078</span>
+              </div>
+            </td>
+            <td>16</td><td>23</td>
+            <td><span class="badge" style="background:rgba(248,113,113,0.15);color:var(--danger);border-color:rgba(248,113,113,0.3)">协作</span></td>
+          </tr>
+          <tr>
+            <td>s12_worktree_task_isolation.py</td>
+            <td>Worktree 隔离：目录级隔离 + 事件总线 + 任务ID</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:67%"></div></div>
+                <span class="bar-num">912</span>
+              </div>
+            </td>
+            <td>11</td><td>14</td>
+            <td><span class="badge" style="background:rgba(248,113,113,0.15);color:var(--danger);border-color:rgba(248,113,113,0.3)">协作</span></td>
+          </tr>
+          <tr>
+            <td>s13_mcp_tools.py <span class="module-tag tag-new">NEW</span></td>
+            <td>MCP 集成：stdio JSON-RPC 桥接 + 工具自动发现</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:23%"></div></div>
+                <span class="bar-num">316</span>
+              </div>
+            </td>
+            <td>1</td><td>1</td>
+            <td><span class="badge green">扩展</span></td>
+          </tr>
+          <tr>
+            <td>s14_streaming.py <span class="module-tag tag-new">NEW</span></td>
+            <td>流式输出：stream=True + chunk delta 累积</td>
+            <td>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" style="width:25%"></div></div>
+                <span class="bar-num">348</span>
+              </div>
+            </td>
+            <td>9</td><td>4</td>
+            <td><span class="badge green">扩展</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ═══════════════ ARCHITECTURE ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#127959;&#65039;</span> 架构演进路径</h2>
+    <div class="arch-diagram">
+<span class="hi">基础层</span>  s01 ──► s02 ──► s03
+         │         │         │
+      Agent循环   多工具    TodoWrite状态
+         │
+<span class="hi2">隔离层</span>  s04 ──► s05 ──► s06
+         │         │         │
+      子智能体    Skills    上下文压缩(3层)
+      独立上下文  按需注入  micro/auto/manual
+         │
+<span class="hw">持久层</span>  s07 ──► s08
+         │         │
+      JSON任务图  后台线程任务
+      依赖解析    完成通知拉取
+         │
+<span class="hi3">协作层</span>  s09 ──► s10 ──► s11 ──► s12
+         │         │         │         │
+      JSONL收件箱 request_id 自治代理  Worktree
+      命名成员    协议状态机 任务认领   目录隔离
+         │
+<span class="hi">扩展层</span>  s13 ──► s14
+         │         │
+      MCP协议桥   流式输出
+      工具自动发现 chunk累积
+    </div>
+  </section>
+
+  <!-- ═══════════════ LAYER CARDS ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#9881;&#65039;</span> 核心设计模式</h2>
+    <div class="layer-grid">
+      <div class="layer-card">
+        <h3>Agent 循环（s01 起）</h3>
+        <ul>
+          <li>LLM 调用 → tool_calls 判断 → 执行工具 → 追加 messages</li>
+          <li><span>while True</span> 直到 finish_reason != tool_calls</li>
+          <li>每轮记录完整 messages 变更日志</li>
+          <li>双输出日志：彩色终端 + 纯文本文件 (<span>agent_debug.log</span>)</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>子智能体隔离（s04）</h3>
+        <ul>
+          <li>父 Agent 调用 <span>task</span> 工具触发子 Agent</li>
+          <li>子 Agent 启动时 <span>messages=[]</span>，全新上下文</li>
+          <li>子 Agent 工具集去掉 <span>task</span>，防止无限递归</li>
+          <li>子 Agent 完成后只返回文本摘要给父上下文</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>上下文压缩三层（s06）</h3>
+        <ul>
+          <li><span>micro_compact</span>：每轮静默替换旧 tool_result 为占位符</li>
+          <li><span>auto_compact</span>：超 token 阈值，LLM 生成摘要替换全历史</li>
+          <li><span>compact tool</span>：模型主动调用手动触发压缩</li>
+          <li>压缩前保存完整 transcript 到 <span>.transcripts/</span></li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>任务持久化（s07）</h3>
+        <ul>
+          <li>任务存储在 <span>.tasks/task_N.json</span>，跨压缩周期存活</li>
+          <li>支持 <span>blockedBy / blocks</span> 双向依赖图</li>
+          <li>完成任务时自动从所有 blockedBy 列表移除</li>
+          <li>使用 <span>_atomic_write</span> 防止崩溃时文件损坏</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>团队通信（s09-s10）</h3>
+        <ul>
+          <li>成员配置存 <span>.team/config.json</span></li>
+          <li>通信通过 <span>.team/inbox/name.jsonl</span> 文件追加</li>
+          <li>5 种消息类型：message / broadcast / shutdown_request / shutdown_response / plan_approval_response</li>
+          <li>s10 用 <span>request_id</span> 关联请求与响应</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>MCP 协议桥（s13）</h3>
+        <ul>
+          <li>内嵌 FastMCP server 脚本，写入临时文件后子进程启动</li>
+          <li>通过 <span>stdio_client</span> JSON-RPC 通信</li>
+          <li><span>mcp_list_tools()</span> 自动转换 MCP schema → OpenAI format</li>
+          <li>agent loop 本身与 s01 完全相同，只换了工具来源</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ CODE DUPLICATION ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128203;</span> 代码重复分析</h2>
+    <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">
+      以下函数/类在多个脚本中几乎原样重复（教学设计的有意选择，但形成维护负担）：
+    </p>
+    <div class="dup-grid">
+      <div class="dup-card">
+        <div class="fn">ColorFormatter</div>
+        <div class="cnt">14</div>
+        <div class="sub">个文件中重复</div>
+      </div>
+      <div class="dup-card">
+        <div class="fn">setup_logger()</div>
+        <div class="cnt">14</div>
+        <div class="sub">个文件中重复</div>
+      </div>
+      <div class="dup-card">
+        <div class="fn">run_bash()</div>
+        <div class="cnt">11</div>
+        <div class="sub">个文件中重复</div>
+      </div>
+      <div class="dup-card">
+        <div class="fn">safe_path()</div>
+        <div class="cnt">9</div>
+        <div class="sub">个文件中重复</div>
+      </div>
+      <div class="dup-card">
+        <div class="fn">_msg_summary()</div>
+        <div class="cnt">12</div>
+        <div class="sub">个文件中重复</div>
+      </div>
+      <div class="dup-card">
+        <div class="fn">agent_loop()</div>
+        <div class="cnt">14</div>
+        <div class="sub">个文件中重复（变体）</div>
+      </div>
+    </div>
+    <p style="font-size:0.8rem;color:var(--text-dim);margin-top:0.8rem;">
+      估算：约 ~2,800 行为可提取的共享代码（占总量约 41%）
+    </p>
+  </section>
+
+  <!-- ═══════════════ ISSUES / SUGGESTIONS ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128270;</span> 问题与改进建议</h2>
+    <div class="issue-list">
+
+      <div class="issue-card high">
+        <div class="title">
+          <span class="pill high">高</span>
+          Token 估算对中文严重失准
+        </div>
+        <div class="desc">
+          s06 用 <code>len(json_dumps) // 4</code> 粗估 token 数。中文字符 1 个约占 1–2 token，
+          4 字符=1 token 的假设只适用于纯英文，实际阈值触发时机会大幅偏差，可能导致压缩过早或过晚。
+          建议引入 <code>tiktoken</code> 作可选依赖，降级时再回退字符估算。
+        </div>
+        <div class="files">影响文件：s06_context_compact.py（estimate_tokens 函数）</div>
+      </div>
+
+      <div class="issue-card high">
+        <div class="title">
+          <span class="pill high">高</span>
+          危险命令黑名单存在误杀与绕过风险
+        </div>
+        <div class="desc">
+          当前用字符串 <code>in</code> 匹配黑名单（如 <code>"sudo"</code>），会误拦截
+          <code>pseudocode</code>、<code>cat sudoku.txt</code> 等合法命令；
+          同时攻击者可用 <code>s\udo</code>、换行符等手法绕过。
+          建议改为 shlex 解析命令，仅匹配首个词，或使用正则精确匹配边界。
+        </div>
+        <div class="files">影响文件：所有 sNN 中的 run_bash() — 11 处</div>
+      </div>
+
+      <div class="issue-card medium">
+        <div class="title">
+          <span class="pill medium">中</span>
+          s09-s11 JSONL 收件箱写入缺少文件锁
+        </div>
+        <div class="desc">
+          多个线程可能同时追加写同一个 <code>.team/inbox/name.jsonl</code>，存在竞态条件，
+          可能导致 JSONL 行损坏（半行写入）。建议加 <code>threading.Lock</code> 或使用原子追加写。
+        </div>
+        <div class="files">影响文件：s09_agent_teams.py, s10_team_protocols.py, s11_autonomous_agents.py</div>
+      </div>
+
+      <div class="issue-card medium">
+        <div class="title">
+          <span class="pill medium">中</span>
+          工具调用串行执行，可并行的调用被浪费
+        </div>
+        <div class="desc">
+          LLM 有时一次返回多个无依赖的 tool_call（如同时读两个文件），当前所有 tool_calls
+          都是 for 循环串行执行。引入 <code>ThreadPoolExecutor</code> 并行执行无依赖工具调用可明显提速。
+        </div>
+        <div class="files">影响文件：所有包含 agent_loop 的文件</div>
+      </div>
+
+      <div class="issue-card medium">
+        <div class="title">
+          <span class="pill medium">中</span>
+          s06 的 auto_compact 使用纯文本截断，截断点可能切断 JSON 结构
+        </div>
+        <div class="desc">
+          <code>conversation_text = json.dumps(messages)[:80000]</code> 按字符截断，可能把
+          一条消息的 JSON 切断到中间，LLM 收到的是不合法 JSON。建议按消息边界截断：
+          先将 messages 从尾部裁剪到字符数限制内，而不是截断序列化字符串。
+        </div>
+        <div class="files">影响文件：s06_context_compact.py（auto_compact 函数，约第 133 行）</div>
+      </div>
+
+      <div class="issue-card low">
+        <div class="title">
+          <span class="pill low">低</span>
+          缺少 .env.example 示例配置文件
+        </div>
+        <div class="desc">
+          README 中列出了环境变量说明，但仓库中没有 <code>.env.example</code>，
+          新用户容易遗漏配置。添加一份带注释的示例文件可降低上手门槛。
+        </div>
+        <div class="files">建议新增：.env.example</div>
+      </div>
+
+      <div class="issue-card low">
+        <div class="title">
+          <span class="pill low">低</span>
+          s13 MCP server 脚本以字符串拼接嵌入，可读性差且难以维护
+        </div>
+        <div class="desc">
+          <code>MCP_SERVER_SCRIPT</code> 是把完整 Python 代码写成字符串常量，
+          没有语法高亮和 IDE 支持。建议改为 <code>importlib.resources</code>
+          或 <code>textwrap.dedent</code> + 多行字符串，或单独放在 <code>_mcp_server.py</code> 文件中。
+        </div>
+        <div class="files">影响文件：s13_mcp_tools.py（MCP_SERVER_SCRIPT 常量，第 101-171 行）</div>
+      </div>
+
+      <div class="issue-card low">
+        <div class="title">
+          <span class="pill low">低</span>
+          缺少公共模块 agent_utils.py，维护成本高
+        </div>
+        <div class="desc">
+          ColorFormatter、setup_logger、run_bash、run_read、run_write、run_edit、safe_path、
+          _msg_summary 在 14 个文件中几乎原样重复约 ~2,800 行。
+          可以提取为 <code>agent_utils.py</code> 共享模块，各脚本 import 即可，
+          同时不破坏"每个脚本独立可运行"的教学设计。
+        </div>
+        <div class="files">建议新增：agent_utils.py</div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ═══════════════ GIT HISTORY ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128640;</span> Git 提交历史</h2>
+    <ul class="commit-list">
+      <li>
+        <span class="commit-hash">3abd5af</span>
+        <span class="commit-msg">Secure logs, atomic writes, threading fixes
+          <span class="badge warn" style="margin-left:0.5rem">最新</span>
+        </span>
+      </li>
+      <li>
+        <span class="commit-hash">63a5c27</span>
+        <span class="commit-msg">增加 debug log</span>
+      </li>
+      <li>
+        <span class="commit-hash">73ba061</span>
+        <span class="commit-msg">修复了一些竞争条件下的错误</span>
+      </li>
+      <li>
+        <span class="commit-hash">6d4401a</span>
+        <span class="commit-msg">Update README.md</span>
+      </li>
+      <li>
+        <span class="commit-hash">b789494</span>
+        <span class="commit-msg">Update README.md</span>
+      </li>
+      <li>
+        <span class="commit-hash">d996890</span>
+        <span class="commit-msg">Initial commit</span>
+      </li>
+    </ul>
+    <p style="font-size:0.82rem;color:var(--text-muted);margin-top:0.8rem;">
+      近期改进：最新提交加固了日志文件权限（chmod 0o600）、引入原子写（_atomic_write）、
+      修复了多线程竞争条件，显示项目正在向生产质量靠拢。
+    </p>
+  </section>
+
+  <!-- ═══════════════ DEPENDENCY ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128230;</span> 依赖分析</h2>
+    <div class="layer-grid">
+      <div class="layer-card">
+        <h3>必选依赖（requirements.txt）</h3>
+        <ul>
+          <li><span>openai &gt;= 1.40.0</span> — LLM 调用（OpenAI 兼容协议）</li>
+          <li><span>python-dotenv &gt;= 1.0.0</span> — .env 配置加载</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>可选依赖（需手动安装）</h3>
+        <ul>
+          <li><span>mcp</span> — 运行 s13_mcp_tools.py 需要</li>
+          <li><span>git</span> — 运行 s12_worktree_task_isolation.py 需要</li>
+          <li><span>tiktoken</span>（建议）— 更准确的 token 估算</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ NEXT STEPS ═══════════════ -->
+  <section>
+    <h2><span class="ico">&#128161;</span> 建议下一步行动</h2>
+    <div class="layer-grid">
+      <div class="layer-card">
+        <h3>&#128293; 高优先级</h3>
+        <ul>
+          <li>修复 auto_compact 按消息边界截断（而非字符截断）</li>
+          <li>修复危险命令黑名单为 shlex 解析 + 词边界匹配</li>
+          <li>引入 tiktoken 修正 token 估算精度</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>&#128204; 中优先级</h3>
+        <ul>
+          <li>为 s09-s11 收件箱写入加 threading.Lock</li>
+          <li>实现工具并行执行（ThreadPoolExecutor）</li>
+          <li>添加 .env.example 配置模板</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>&#128196; 低优先级 / 长期</h3>
+        <ul>
+          <li>提取 agent_utils.py 公共模块消除重复</li>
+          <li>把 s13 MCP server 字符串改为独立文件</li>
+          <li>为工具函数添加 pytest 单元测试</li>
+        </ul>
+      </div>
+      <div class="layer-card">
+        <h3>&#128218; 可新增模块</h3>
+        <ul>
+          <li>s15：并行子智能体（FanOut pattern）</li>
+          <li>s16：RAG 检索增强（向量数据库集成）</li>
+          <li>tests/：pytest 单元测试套件</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  learn-claude-code-openai 项目分析报告 &nbsp;|&nbsp; 由 Claude Code 自动生成 &nbsp;|&nbsp; 2026-06-04
+</footer>
+
+</body>
+</html>
